@@ -12,6 +12,9 @@ import com.fasterxml.jackson.module.kotlin.readValue
 import org.gradle.api.tasks.Internal
 import org.gradle.work.DisableCachingByDefault
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.atomic.AtomicInteger
 
 class CapsuleManager(private val project: Project) {
 
@@ -153,6 +156,37 @@ class CapsuleManager(private val project: Project) {
 
             return CapsuleScript(deckName, slides)
         }
+
+        fun resolveScriptDir(project: Project, capsuleExt: CapsuleExtension): File {
+            val configured = capsuleExt.sliderScriptDir.get()
+            val candidate = project.layout.buildDirectory.dir(configured).get().asFile
+            if (candidate.exists() && candidate.listFiles()
+                    ?.any { it.name.endsWith("-script.txt") } == true
+            ) {
+                return candidate
+            }
+            val sliderOutput = project.rootProject.projectDir.parentFile
+                ?.resolve("slider-plugin")
+                ?.resolve("slider")
+                ?.resolve("build")
+                ?.resolve("capsule")
+            if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
+            return candidate
+        }
+
+        fun resolveDeckDir(project: Project, capsuleExt: CapsuleExtension): File {
+            val configured = capsuleExt.deckSourceDir.get()
+            val candidate = project.layout.buildDirectory.dir(configured).get().asFile
+            if (candidate.exists()) return candidate
+            val sliderOutput = project.rootProject.projectDir.parentFile
+                ?.resolve("slider-plugin")
+                ?.resolve("slider")
+                ?.resolve("build")
+                ?.resolve("docs")
+                ?.resolve("asciidocRevealJs")
+            if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
+            return candidate
+        }
     }
 }
 
@@ -171,7 +205,7 @@ open class CapsuleScriptTask : DefaultTask() {
 
     @TaskAction
     fun execute() {
-        val scriptDir = resolveScriptDir()
+        val scriptDir = CapsuleManager.resolveScriptDir(project, capsuleExtension)
         val scripts = CapsuleManager.readScriptFiles(scriptDir)
 
         if (scripts.isEmpty()) {
@@ -191,26 +225,6 @@ open class CapsuleScriptTask : DefaultTask() {
                 )
             }
         }
-    }
-
-    private fun resolveScriptDir(): File {
-        val configured = capsuleExtension.sliderScriptDir.get()
-
-        val candidate = project.layout.buildDirectory.dir(configured).get().asFile
-        if (candidate.exists() && candidate.listFiles()
-                ?.any { it.name.endsWith("-script.txt") } == true
-        ) {
-            return candidate
-        }
-
-        val sliderOutput = project.rootProject.projectDir.parentFile
-            ?.resolve("slider-plugin")
-            ?.resolve("slider")
-            ?.resolve("build")
-            ?.resolve("capsule")
-        if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
-
-        return candidate
     }
 }
 
@@ -250,9 +264,11 @@ open class CapsuleBuildTask : DefaultTask() {
                 }
             }
             "espeak" -> {
-                val engine = EspeakTtsEngine()
+                val voice = capsuleExtension.espeakVoice.get()
+                val speed = capsuleExtension.espeakSpeed.get()
+                val engine = EspeakTtsEngine(voice = voice, speed = speed)
                 if (engine.isAvailable()) {
-                    logger.lifecycle("TTS engine: espeak")
+                    logger.lifecycle("TTS engine: espeak (voice={}, speed={})", voice, speed)
                     engine
                 } else {
                     logger.warn("espeak not available, falling back to noop placeholder")
@@ -272,7 +288,7 @@ open class CapsuleBuildTask : DefaultTask() {
 
     @TaskAction
     fun execute() {
-        val scriptDir = resolveScriptDir()
+        val scriptDir = CapsuleManager.resolveScriptDir(project, capsuleExtension)
         val scripts = CapsuleManager.readScriptFiles(scriptDir)
 
         if (scripts.isEmpty()) {
@@ -288,8 +304,11 @@ open class CapsuleBuildTask : DefaultTask() {
         val engine = resolveTtsEngine()
         logger.lifecycle("TTS engine: {}", engine.name())
 
-        var totalSynthesized = 0
-        var totalFailed = 0
+        val cores = Runtime.getRuntime().availableProcessors()
+        val executor = Executors.newFixedThreadPool(cores)
+        val synthesized = AtomicInteger(0)
+        val failed = AtomicInteger(0)
+        val futures = mutableListOf<Future<*>>()
 
         for (script in scripts) {
             val parsed = CapsuleManager.parseScript(script)
@@ -300,50 +319,38 @@ open class CapsuleBuildTask : DefaultTask() {
                 val idx = String.format("%02d", seg.index)
                 val ttsFile = deckOutputDir.resolve("slide-$idx.mp3")
 
-                try {
-                    engine.synthesize(seg.speakerNote, ttsFile)
-                    totalSynthesized++
-                    logger.lifecycle("  TTS → {} ({} chars)", ttsFile.name, seg.speakerNote.length)
-                } catch (e: TtsException) {
-                    totalFailed++
-                    logger.error("  TTS FAILED slide {}: {}", seg.index, e.message)
-                    if (!capsuleExtension.ttsFallbackEnabled.get()) throw e
-                }
+                futures.add(executor.submit {
+                    try {
+                        engine.synthesize(seg.speakerNote, ttsFile)
+                        synthesized.incrementAndGet()
+                        logger.lifecycle("  TTS → {} ({} chars)", ttsFile.name, seg.speakerNote.length)
+                    } catch (e: TtsException) {
+                        failed.incrementAndGet()
+                        logger.error("  TTS FAILED slide {}: {}", seg.index, e.message)
+                    }
+                })
             }
         }
 
-        logger.lifecycle(
-            "TTS generation: {} synthesized, {} failed, {} engine",
-            totalSynthesized, totalFailed, engine.name()
-        )
-    }
+        futures.forEach { it.get() }
+        executor.shutdown()
 
-    private fun resolveScriptDir(): File {
-        val configured = capsuleExtension.sliderScriptDir.get()
-
-        val candidate = project.layout.buildDirectory.dir(configured).get().asFile
-        if (candidate.exists() && candidate.listFiles()
-                ?.any { it.name.endsWith("-script.txt") } == true
-        ) {
-            return candidate
+        if (failed.get() > 0 && !capsuleExtension.ttsFallbackEnabled.get()) {
+            throw TtsException("${failed.get()} TTS synthesis failures (fallback disabled)")
         }
 
-        val sliderOutput = project.rootProject.projectDir.parentFile
-            ?.resolve("slider-plugin")
-            ?.resolve("slider")
-            ?.resolve("build")
-            ?.resolve("capsule")
-        if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
-
-        return candidate
+        logger.lifecycle(
+            "TTS generation: {} synthesized, {} failed, {} engine, {} cores",
+            synthesized.get(), failed.get(), engine.name(), cores
+        )
     }
 }
 
 @DisableCachingByDefault(because = "Filesystem-bound: injects audio into HTML deck and captures video via Playwright")
 open class CapsuleVideoTask : DefaultTask() {
 
-    @get:OutputFile
-    val outputFile: RegularFileProperty = project.objects.fileProperty()
+    @get:OutputDirectory
+    val outputDir: DirectoryProperty = project.objects.directoryProperty()
 
     @get:Internal
     lateinit var capsuleExtension: CapsuleExtension
@@ -355,9 +362,43 @@ open class CapsuleVideoTask : DefaultTask() {
     internal var ttsEngine: TtsEngine? = null
 
     init {
-        outputFile.convention(
-            project.layout.buildDirectory.file("capsule/capsule.webm")
-        )
+        outputDir.convention(project.layout.buildDirectory.dir("capsule"))
+    }
+
+    companion object {
+        private val AUDIO_INJECT_SCRIPT = """
+<!-- CAPSULE-GRADLE: Autoplay audio injection -->
+<script>
+(function() {
+  var currentAudio = null;
+  var sections = document.querySelectorAll('.reveal .slides section[data-audio]');
+  var audios = [];
+  sections.forEach(function(sec) {
+    var src = sec.getAttribute('data-audio');
+    if (src) {
+      var audio = new Audio(src.replace('file://', ''));
+      audio.id = 'audio-' + audios.length;
+      document.body.appendChild(audio);
+      audios.push(audio);
+    }
+  });
+  function playSlideAudio(idx) {
+    if (currentAudio) { currentAudio.pause(); currentAudio.currentTime = 0; }
+    currentAudio = audios[idx];
+    if (currentAudio) {
+      currentAudio.currentTime = 0;
+      currentAudio.play().catch(function(e) { console.warn('Audio play failed:', e); });
+    }
+  }
+  if (typeof Reveal !== 'undefined') {
+    Reveal.on('slidechanged', function(event) {
+      playSlideAudio(event.indexh);
+    });
+    if (audios.length > 0) playSlideAudio(0);
+  }
+})();
+</script>
+"""
     }
 
     private fun resolvePlaywrightCapture(slideDurations: List<Double>): PlaywrightCapture {
@@ -390,7 +431,10 @@ open class CapsuleVideoTask : DefaultTask() {
                 if (engine.isAvailable()) engine else NoOpTtsEngine()
             }
             "espeak" -> {
-                val engine = EspeakTtsEngine()
+                val engine = EspeakTtsEngine(
+                    voice = capsuleExtension.espeakVoice.get(),
+                    speed = capsuleExtension.espeakSpeed.get()
+                )
                 if (engine.isAvailable()) engine else NoOpTtsEngine()
             }
             else -> NoOpTtsEngine()
@@ -411,8 +455,8 @@ open class CapsuleVideoTask : DefaultTask() {
 
     @TaskAction
     fun execute() {
-        val deckDir = resolveDeckDir()
-        val scriptDir = resolveScriptDir()
+        val deckDir = CapsuleManager.resolveDeckDir(project, capsuleExtension)
+        val scriptDir = CapsuleManager.resolveScriptDir(project, capsuleExtension)
 
         val deckFiles = deckDir.listFiles { f -> f.name.endsWith("-deck.html") }?.toList()
             ?: emptyList()
@@ -429,9 +473,9 @@ open class CapsuleVideoTask : DefaultTask() {
             return
         }
 
-        val outDir = project.projectDir.resolve(
+        val outDir = project.layout.buildDirectory.dir(
             capsuleExtension.outputDir.get()
-        )
+        ).get().asFile
         outDir.mkdirs()
 
         val engine = resolveTtsEngine()
@@ -466,37 +510,129 @@ open class CapsuleVideoTask : DefaultTask() {
             videoOutputDir.mkdirs()
 
             val slideDurations = computeSlideDurations(parsed, audioDir)
-            val deckCapture = resolvePlaywrightCapture(slideDurations)
-            try {
-                deckCapture.capture(
-                    deckHtmlPath = modifiedDeck.absolutePath,
-                    outputDir = videoOutputDir,
-                    viewportWidth = capsuleExtension.viewportWidth.get(),
-                    viewportHeight = capsuleExtension.viewportHeight.get(),
-                    slideDurations = slideDurations
-                )
-                deckCapture.close()
+            val cores = Runtime.getRuntime().availableProcessors()
+            logger.lifecycle(
+                "Parallel capture: {} slides on {} cores", parsed.slides.size, cores
+            )
 
-                val generatedVideo = videoOutputDir.listFiles { f -> f.name.endsWith(".webm") }
-                    ?.firstOrNull()
-                if (generatedVideo != null) {
-                    val finalVideo = outDir.resolve("${parsed.deckName}.webm")
-                    generatedVideo.copyTo(finalVideo, overwrite = true)
-                    mixAudioWithVideo(finalVideo, audioDir, parsed.slides, capsuleExtension.slideDurationSeconds.get())
-                    logger.lifecycle("CAPSULE → {}", finalVideo.absolutePath)
-                } else {
-                    logger.warn("No video generated by Playwright capture for '{}'", parsed.deckName)
-                }
-            } catch (e: CapturingException) {
-                logger.error("Playwright capture failed for '{}': {}", parsed.deckName, e.message)
-                throw e
+            val slideWebms = captureSlideParallel(
+                modifiedDeck, parsed, slideDurations, videoOutputDir, cores
+            )
+
+            if (slideWebms.isNotEmpty()) {
+                val finalVideo = outDir.resolve("${parsed.deckName}.webm")
+                concatWebmFiles(slideWebms, finalVideo)
+                mixAudioWithVideo(finalVideo, audioDir, parsed.slides, capsuleExtension.slideDurationSeconds.get())
+                logger.lifecycle("CAPSULE → {}", finalVideo.absolutePath)
+            } else {
+                logger.warn("No video segments produced for '{}'", parsed.deckName)
             }
         }
     }
 
+    private fun captureSlideParallel(
+        deck: File,
+        script: CapsuleScript,
+        slideDurations: List<Double>,
+        outputDir: File,
+        cores: Int
+    ): List<File> {
+        // Cap parallel Playwright instances: each Chromium needs ~300 MB RAM + CPU startup.
+        // Beyond 4 simultaneous instances the gains plateau and timeouts start appearing.
+        val parallelism = minOf(cores, 4)
+        val executor = Executors.newFixedThreadPool(parallelism)
+        val futures = mutableListOf<Future<File?>>()
+
+        val playwrightTimeout = capsuleExtension.playwrightTimeout.get()
+        val viewportWidth    = capsuleExtension.viewportWidth.get()
+        val viewportHeight   = capsuleExtension.viewportHeight.get()
+        val defaultDur       = capsuleExtension.slideDurationSeconds.get()
+
+        for ((i, seg) in script.slides.withIndex()) {
+            val duration  = slideDurations.getOrElse(i) { defaultDur }
+            val slideDir  = outputDir.resolve("slide-${String.format("%02d", seg.index)}").also { it.mkdirs() }
+            val slideHtml = createSingleSlideHtml(deck, i)
+
+            futures.add(executor.submit<File?> {
+                val capture = ScreenshotCaptureImpl(timeout = playwrightTimeout)
+                return@submit try {
+                    capture.capture(
+                        deckHtmlPath = slideHtml.absolutePath,
+                        outputDir = slideDir,
+                        viewportWidth = viewportWidth,
+                        viewportHeight = viewportHeight,
+                        slideDurations = listOf(duration)
+                    )
+                    capture.close()
+                    val webm = slideDir.resolve("slide.webm").takeIf { it.exists() }
+                    logger.lifecycle("  ✓ slide {} ({}s)", seg.index, String.format("%.1f", duration))
+                    webm
+                } catch (e: Exception) {
+                    capture.close()
+                    logger.error("  ✗ slide {} failed: {}", seg.index, e.message)
+                    null
+                }
+            })
+        }
+
+        executor.shutdown()
+        return futures.mapNotNull { it.get() }
+    }
+
+    private fun createSingleSlideHtml(deck: File, slideIndex: Int): File {
+        val content = deck.readText()
+        val isolateScript = """
+<script>
+(function() {
+  function isolate(idx) {
+    var sections = document.querySelectorAll('.reveal .slides > section, .slides > section');
+    sections.forEach(function(s, i) {
+      s.style.visibility = (i === idx) ? 'visible' : 'hidden';
+      s.style.position   = (i === idx) ? 'relative' : 'absolute';
+      s.style.display    = (i === idx) ? ''         : 'none';
+    });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function() { isolate($slideIndex); });
+  } else {
+    isolate($slideIndex);
+  }
+})();
+</script>
+"""
+        val injected = content.replace("</head>", "$isolateScript</head>")
+        val outFile = deck.parentFile.resolve("slide-${String.format("%02d", slideIndex)}-${deck.name}")
+        outFile.writeText(injected)
+        return outFile
+    }
+
+    private fun concatWebmFiles(files: List<File>, output: File) {
+        if (files.size == 1) {
+            files[0].copyTo(output, overwrite = true)
+            return
+        }
+        val concatList = output.parentFile.resolve("concat-list.txt")
+        concatList.writeText(files.joinToString("\n") { "file '${it.absolutePath}'" })
+
+        val proc = ProcessBuilder(
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", concatList.absolutePath,
+            "-c", "copy",
+            output.absolutePath
+        ).redirectErrorStream(true).start()
+
+        val exitCode = proc.waitFor()
+        if (exitCode != 0) {
+            val err = proc.inputStream.bufferedReader().readText()
+            throw RuntimeException("FFmpeg concat failed (exit $exitCode): $err")
+        }
+        concatList.delete()
+        logger.lifecycle("  Concat: {} segments → {}", files.size, output.name)
+    }
+
     private fun injectAudio(deckFile: File, script: CapsuleScript, audioDir: File): File {
         val originalHtml = deckFile.readText()
-        val injectedDir = deckFile.parentFile
+        val injectedDir = project.layout.buildDirectory.dir("capsule/injected").get().asFile
         injectedDir.mkdirs()
 
         val hasAudio = script.slides.any { seg ->
@@ -537,52 +673,14 @@ open class CapsuleVideoTask : DefaultTask() {
             return injectAudioSequentialFallback(deckFile, script, audioDir, injectedDir)
         }
 
-        val audioScriptInject = """
-<!-- CAPSULE-GRADLE: Autoplay audio injection -->
-<script>
-(function() {
-  var currentAudio = null;
-  var sections = document.querySelectorAll('.reveal .slides section[data-audio]');
-  var audios = [];
-  sections.forEach(function(sec) {
-    var src = sec.getAttribute('data-audio');
-    if (src) {
-      var audio = new Audio(src.replace('file://', ''));
-      audio.id = 'audio-' + audios.length;
-      document.body.appendChild(audio);
-      audios.push(audio);
-    }
-  });
-  function playSlideAudio(idx) {
-    if (currentAudio) { currentAudio.pause(); currentAudio.currentTime = 0; }
-    currentAudio = audios[idx];
-    if (currentAudio) {
-      currentAudio.currentTime = 0;
-      currentAudio.play().catch(function(e) { console.warn('Audio play failed:', e); });
-    }
-  }
-  if (typeof Reveal !== 'undefined') {
-    Reveal.on('slidechanged', function(event) {
-      playSlideAudio(event.indexh);
-    });
-    if (audios.length > 0) playSlideAudio(0);
-  }
-})();
-</script>
-"""
-
         val injected = injectedHtml.replace(
             "</body>",
-            "$audioScriptInject</body>"
+            "$AUDIO_INJECT_SCRIPT</body>"
         )
 
         val outFile = injectedDir.resolve(deckFile.name)
         outFile.writeText(injected)
         return outFile
-    }
-
-    private fun isPlaceholder(file: File): Boolean {
-        return file.length() < 500 && file.readText().startsWith("# TTS PLACEHOLDER")
     }
 
     private fun injectAudioSequentialFallback(
@@ -615,43 +713,14 @@ open class CapsuleVideoTask : DefaultTask() {
             append(originalHtml.substring(lastEnd))
         }
 
-        val audioScriptInject = """
-<!-- CAPSULE-GRADLE: Autoplay audio injection (sequential fallback) -->
-<script>
-(function() {
-  var currentAudio = null;
-  var sections = document.querySelectorAll('.reveal .slides section[data-audio]');
-  var audios = [];
-  sections.forEach(function(sec) {
-    var src = sec.getAttribute('data-audio');
-    if (src) {
-      var audio = new Audio(src.replace('file://', ''));
-      audio.id = 'audio-' + audios.length;
-      document.body.appendChild(audio);
-      audios.push(audio);
-    }
-  });
-  function playSlideAudio(idx) {
-    if (currentAudio) { currentAudio.pause(); currentAudio.currentTime = 0; }
-    currentAudio = audios[idx];
-    if (currentAudio) {
-      currentAudio.currentTime = 0;
-      currentAudio.play().catch(function(e) { console.warn('Audio play failed:', e); });
-    }
-  }
-  if (typeof Reveal !== 'undefined') {
-    Reveal.on('slidechanged', function(event) {
-      playSlideAudio(event.indexh);
-    });
-    if (audios.length > 0) playSlideAudio(0);
-  }
-})();
-</script>
-"""
+        val sequentialScript = AUDIO_INJECT_SCRIPT.replace(
+            "<!-- CAPSULE-GRADLE: Autoplay audio injection -->",
+            "<!-- CAPSULE-GRADLE: Autoplay audio injection (sequential fallback) -->"
+        )
 
         val injected = injectedHtml.replace(
             "</body>",
-            "$audioScriptInject</body>"
+            "$sequentialScript</body>"
         )
 
         val outFile = injectedDir.resolve(deckFile.name)
@@ -659,35 +728,15 @@ open class CapsuleVideoTask : DefaultTask() {
         return outFile
     }
 
-    private fun resolveDeckDir(): File {
-        val configured = capsuleExtension.deckSourceDir.get()
-        val candidate = project.layout.buildDirectory.dir(configured).get().asFile
-        if (candidate.exists()) return candidate
-
-        val sliderOutput = project.rootProject.projectDir.parentFile
-            ?.resolve("slider-plugin")
-            ?.resolve("slider")
-            ?.resolve("build")
-            ?.resolve("docs")
-            ?.resolve("asciidocRevealJs")
-        if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
-
-        return candidate
-    }
-
-    private fun resolveScriptDir(): File {
-        val configured = capsuleExtension.sliderScriptDir.get()
-        val candidate = project.layout.buildDirectory.dir(configured).get().asFile
-        if (candidate.exists()) return candidate
-
-        val sliderOutput = project.rootProject.projectDir.parentFile
-            ?.resolve("slider-plugin")
-            ?.resolve("slider")
-            ?.resolve("build")
-            ?.resolve("capsule")
-        if (sliderOutput != null && sliderOutput.exists()) return sliderOutput
-
-        return candidate
+    private fun ffprobeDuration(file: File): Double {
+        return try {
+            val proc = ProcessBuilder("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", file.absolutePath)
+                .redirectErrorStream(true)
+                .start()
+            val out = proc.inputStream.bufferedReader().readText().trim()
+            proc.waitFor()
+            out.toDoubleOrNull() ?: 0.0
+        } catch (_: Exception) { 0.0 }
     }
 
     private fun mixAudioWithVideo(videoFile: File, audioDir: File, slides: List<SlideSegment>, slideDurationSeconds: Double) {
@@ -719,9 +768,7 @@ open class CapsuleVideoTask : DefaultTask() {
             if (exitCode == 0 && tmpFile.exists()) {
                 tmpFile.renameTo(videoFile)
                 val totalSlides = mp3Files.size
-                val audioDur = mp3Files.sumOf { f ->
-                    ffprobeDuration(f)
-                }
+                val audioDur = mp3Files.sumOf { f -> ffprobeDuration(f) }
                 logger.lifecycle("  Audio mix: {} slides concatenated (audio={}s, video={}s)", totalSlides, String.format("%.1f", audioDur), String.format("%.1f", ffprobeDuration(videoFile)))
             } else {
                 logger.warn("  Audio mix failed (ffmpeg exit code {}), video remains silent", exitCode)
@@ -731,17 +778,6 @@ open class CapsuleVideoTask : DefaultTask() {
             logger.warn("  Audio mix error: {} — video remains silent", e.message)
             tmpFile.delete()
         }
-    }
-
-    private fun ffprobeDuration(file: File): Double {
-        return try {
-            val proc = ProcessBuilder("ffprobe", "-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", file.absolutePath)
-                .redirectErrorStream(true)
-                .start()
-            val out = proc.inputStream.bufferedReader().readText().trim()
-            proc.waitFor()
-            out.toDoubleOrNull() ?: 0.0
-        } catch (_: Exception) { 0.0 }
     }
 }
 
@@ -930,63 +966,15 @@ open class CapsuleCompositeContextTask : DefaultTask() {
             "timestamp" to System.currentTimeMillis()
         )
 
-        val json = buildJsonString(result)
+        val mapper = jacksonObjectMapper()
         val outFile = outputFile.get().asFile
         outFile.parentFile.mkdirs()
-        outFile.writeText(json)
+        mapper.writerWithDefaultPrettyPrinter().writeValue(outFile, result)
 
         logger.lifecycle(
             "CAPSULE COMPOSITE CONTEXT -> {} ({} decks)",
             outFile.absolutePath, capsuleEntries.size
         )
-    }
-
-    private fun buildJsonString(map: Map<*, *>): String {
-        val sb = StringBuilder()
-        sb.append("{\n")
-        map.entries.forEachIndexed { idx, (key, value) ->
-            sb.append("  \"$key\": ")
-            sb.append(valueToJson(value))
-            if (idx < map.size - 1) sb.append(",")
-            sb.append("\n")
-        }
-        sb.append("}")
-        return sb.toString()
-    }
-
-    private fun valueToJson(value: Any?): String {
-        return when (value) {
-            is String -> "\"${value.escapeJson()}\""
-            is Number -> value.toString()
-            is Boolean -> value.toString()
-            is Map<*, *> -> buildJsonString(value)
-            is List<*> -> {
-                val sb = StringBuilder()
-                sb.append("[")
-                if (value.isNotEmpty()) {
-                    sb.append("\n")
-                    value.forEachIndexed { idx, item ->
-                        sb.append("    ")
-                        sb.append(valueToJson(item))
-                        if (idx < value.size - 1) sb.append(",")
-                        sb.append("\n")
-                    }
-                    sb.append("  ")
-                }
-                sb.append("]")
-                sb.toString()
-            }
-            else -> "\"$value\""
-        }
-    }
-
-    private fun String.escapeJson(): String {
-        return this
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
     }
 }
 

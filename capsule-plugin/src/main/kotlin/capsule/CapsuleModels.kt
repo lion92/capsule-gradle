@@ -63,4 +63,10 @@ open class CapsuleExtension @Inject constructor(objects: ObjectFactory) {
 
     val slideDurationSeconds: Property<Double> = objects.property(Double::class.java)
         .convention(5.0)
+
+    val espeakVoice: Property<String> = objects.property(String::class.java)
+        .convention("fr")
+
+    val espeakSpeed: Property<Int> = objects.property(Int::class.java)
+        .convention(150)
 }

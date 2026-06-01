@@ -7,6 +7,7 @@ import com.microsoft.playwright.Page
 import com.microsoft.playwright.Playwright
 import java.io.File
 import java.nio.file.Paths
+import java.nio.file.Path
 
 interface PlaywrightCapture {
     fun capture(deckHtmlPath: String, outputDir: File, viewportWidth: Int, viewportHeight: Int, slideDurations: List<Double>)
@@ -57,6 +58,8 @@ class PlaywrightCaptureImpl(
                 .setRecordVideoSize(viewportWidth, viewportHeight)
         )
         page = context!!.newPage()
+        page!!.setDefaultNavigationTimeout(timeout)
+        page!!.setDefaultTimeout(timeout)
 
         val absolutePath = File(deckHtmlPath).absolutePath
         page!!.navigate("file://$absolutePath")
@@ -73,16 +76,9 @@ class PlaywrightCaptureImpl(
 
         for (i in 0 until slideCount) {
             val slideMs = (slideDurations[i] * 1000).toLong()
-            if (hasAudioElements) {
-                val raceTimeoutMs = slideMs + 2000
-                page!!.waitForFunction(
-                    "new Promise(r => { var a = document.getElementById('audio-$i'); if (a && !a.ended) { var t = setTimeout(r, $raceTimeoutMs); a.onended = r; } else { r(); } })",
-                    null,
-                    Page.WaitForFunctionOptions().setTimeout(timeout)
-                )
-            } else {
-                page!!.waitForTimeout(slideMs.toDouble())
-            }
+            // Always use waitForTimeout: audio doesn't play in headless Chromium.
+            // FFmpeg will mix the audio tracks onto the captured video later.
+            page!!.waitForTimeout(slideMs.toDouble())
             page!!.waitForTimeout(transitionPause)
             if (i < slideCount - 1) {
                 page!!.evaluate("typeof Reveal !== 'undefined' && Reveal.next()")
@@ -128,3 +124,82 @@ class NoOpPlaywrightCapture : PlaywrightCapture {
 }
 
 class CapturingException(message: String) : RuntimeException(message)
+
+/**
+ * Screenshot-based capture: takes a PNG of each slide then uses FFmpeg to produce
+ * a WebM of the exact audio duration. No real-time recording — orders of magnitude
+ * faster and more reliable than Playwright video recording.
+ */
+class ScreenshotCaptureImpl(
+    private val timeout: Double = 120_000.0
+) : PlaywrightCapture {
+
+    private var playwright: Playwright? = null
+    private var browser: Browser? = null
+
+    override fun isAvailable(): Boolean = try {
+        Playwright.create().use { pw ->
+            pw.chromium().launch(BrowserType.LaunchOptions().setHeadless(true)).use { it.close() }
+        }
+        true
+    } catch (_: Exception) { false }
+
+    override fun name(): String = "screenshot+ffmpeg"
+
+    override fun capture(
+        deckHtmlPath: String,
+        outputDir: File,
+        viewportWidth: Int,
+        viewportHeight: Int,
+        slideDurations: List<Double>
+    ) {
+        val duration = slideDurations.firstOrNull() ?: 5.0
+        val absolutePath = File(deckHtmlPath).absolutePath
+
+        playwright = Playwright.create()
+        browser = playwright!!.chromium().launch(BrowserType.LaunchOptions().setHeadless(true))
+
+        val page = browser!!.newPage(
+            Browser.NewPageOptions().setViewportSize(viewportWidth, viewportHeight)
+        )
+        page.setDefaultNavigationTimeout(timeout)
+        page.setDefaultTimeout(timeout)
+        page.navigate("file://$absolutePath")
+        page.waitForSelector(".reveal, section, body",
+            Page.WaitForSelectorOptions().setTimeout(timeout))
+        page.waitForTimeout(800.0)
+
+        val png = outputDir.resolve("slide.png")
+        page.screenshot(Page.ScreenshotOptions().setPath(png.toPath()))
+        page.close()
+
+        // FFmpeg: PNG → WebM of exact duration (1 static frame)
+        val webm = outputDir.resolve("slide.webm")
+        val proc = ProcessBuilder(
+            "ffmpeg", "-y",
+            "-loop", "1",
+            "-framerate", "1",
+            "-i", png.absolutePath,
+            "-t", duration.toString(),
+            "-c:v", "libvpx",
+            "-b:v", "500k",
+            "-vf", "scale=$viewportWidth:$viewportHeight",
+            "-pix_fmt", "yuv420p",
+            "-auto-alt-ref", "0",
+            webm.absolutePath
+        ).redirectErrorStream(true).start()
+
+        val exitCode = proc.waitFor()
+        if (exitCode != 0) {
+            val err = proc.inputStream.bufferedReader().readText()
+            throw CapturingException("FFmpeg PNG→WebM failed (slide): $err")
+        }
+    }
+
+    override fun close() {
+        browser?.close()
+        playwright?.close()
+        browser = null
+        playwright = null
+    }
+}
