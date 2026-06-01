@@ -12,7 +12,7 @@ plugins {
 
 group = "com.cheroliv"
 version = libs.plugins.capsule.get().version
-kotlin.jvmToolchain(JavaVersion.VERSION_24.ordinal)
+kotlin.jvmToolchain(21)
 
 repositories {
     mavenLocal()
@@ -38,7 +38,7 @@ dependencies {
 
 gradlePlugin {
     val capsule by plugins.creating {
-        id = "com.cheroliv.capsule"
+        id = "education.cccp.capsule"
         implementationClass = "capsule.CapsulePlugin"
     }
 }

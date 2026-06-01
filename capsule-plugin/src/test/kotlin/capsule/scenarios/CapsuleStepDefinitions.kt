@@ -263,22 +263,17 @@ $slides
         }
     }
 
-    @Then("the video file {string} exists in the {string} directory not in build/")
-    fun theVideoFileExistsInTheDirectoryNotInBuild(videoName: String, dirName: String) {
-        val videoFile = projectDir.resolve("$dirName/$videoName")
-        assertTrue(videoFile.exists(), "Video must be in $dirName/$videoName, expected: ${videoFile.absolutePath}")
-
-        val buildVideo = projectDir.resolve("build/$dirName/$videoName")
-        if (buildVideo.exists()) {
-            error("Video must NOT be in build/ directory, found at ${buildVideo.absolutePath}")
-        }
+    @Then("the video file {string} exists in the build {string} directory")
+    fun theVideoFileExistsInTheBuildDirectory(videoName: String, dirName: String) {
+        val videoFile = projectDir.resolve("build/$dirName/$videoName")
+        assertTrue(videoFile.exists(), "Video must be in build/$dirName/$videoName, expected: ${videoFile.absolutePath}")
     }
 
     private val webmSignature = byteArrayOf(0x1a.toByte(), 0x45.toByte(), 0xdf.toByte(), 0xa3.toByte())
 
     @Then("the video file {string} has a valid WebM EBML header")
     fun theVideoFileHasAValidWebmEbmlHeader(videoName: String) {
-        val videoFile = projectDir.resolve("capsules/$videoName")
+        val videoFile = projectDir.resolve("build/capsules/$videoName")
         assertTrue(videoFile.exists(), "Video must exist at ${videoFile.absolutePath}")
         assertTrue(videoFile.length() > 0, "Video must not be empty")
 

@@ -132,6 +132,8 @@ class TtsEngineTest {
         assertEquals(120_000.0, ext.playwrightTimeout.get())
         assertEquals("", ext.chromiumExecutablePath.get())
         assertEquals("docs/asciidocRevealJs", ext.deckSourceDir.get())
+        assertEquals("fr", ext.espeakVoice.get())
+        assertEquals(150, ext.espeakSpeed.get())
     }
 }
 
@@ -254,12 +256,12 @@ Voici le contenu principal.
         )
         task.execute()
 
-        val expectedVideo = File(tempDir, "capsule/mon-cours.webm")
+        val expectedVideo = File(tempDir, "build/capsule/mon-cours.webm")
         assertTrue(expectedVideo.exists(), "Expected video at ${expectedVideo.absolutePath}")
         assertTrue(expectedVideo.readText().contains("PLAYWRIGHT CAPTURE PLACEHOLDER"))
 
-        val injectedDeck = File(deckDir, "mon-cours-deck.html")
-        assertTrue(injectedDeck.exists())
+        val injectedDeck = File(tempDir, "build/capsule/injected/mon-cours-deck.html")
+        assertTrue(injectedDeck.exists(), "Expected injected deck at ${injectedDeck.absolutePath}")
         assertTrue(injectedDeck.readText().contains("data-audio"))
     }
 
@@ -299,8 +301,8 @@ Contenu slide 3.
         )
         task.execute()
 
-        val injectedDeck = File(deckDir, "cours-deck.html")
-        assertTrue(injectedDeck.exists())
+        val injectedDeck = File(tempDir, "build/capsule/injected/cours-deck.html")
+        assertTrue(injectedDeck.exists(), "Expected injected deck at ${injectedDeck.absolutePath}")
         val injectedContent = injectedDeck.readText()
         assertTrue(injectedContent.contains("data-audio"), "Should have audio attributes")
         assertTrue(injectedContent.contains("sequential fallback"))
@@ -351,7 +353,7 @@ Deck B.
         )
         task.execute()
 
-        val capDir = File(tempDir, "capsule")
+        val capDir = File(tempDir, "build/capsule")
         val videoA = File(capDir, "cours-a.webm")
         val videoB = File(capDir, "cours-b.webm")
         assertTrue(videoA.exists(), "Expected video for cours-a")
