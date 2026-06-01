@@ -118,6 +118,8 @@ class CapsuleManager(private val project: Project) {
             val slides = mutableListOf<SlideSegment>()
             var currentIndex = -1
             var currentTitle = ""
+            var currentType = SlideType.HTML
+            var currentManimScene: String? = null
             val noteLines = mutableListOf<String>()
 
             for (i in 1 until lines.size) {
@@ -129,7 +131,9 @@ class CapsuleManager(private val project: Project) {
                                 SlideSegment(
                                     index = currentIndex,
                                     title = currentTitle,
-                                    speakerNote = noteLines.joinToString("\n").trim()
+                                    speakerNote = noteLines.joinToString("\n").trim(),
+                                    type = currentType,
+                                    manimScene = currentManimScene
                                 )
                             )
                             noteLines.clear()
@@ -138,7 +142,19 @@ class CapsuleManager(private val project: Project) {
                         val colonIdx = parts.indexOf(":")
                         currentIndex = parts.substring(0, colonIdx).trim()
                             .toIntOrNull() ?: (slides.size + 1)
-                        currentTitle = parts.substring(colonIdx + 1).trim()
+                        // Parse title and optional [manim:SceneName] or [html] tag
+                        val rawTitle = parts.substring(colonIdx + 1).trim()
+                        val manimMatch = Regex("""\[manim:(\w+)]""").find(rawTitle)
+                        currentType = when {
+                            manimMatch != null -> SlideType.MANIM
+                            rawTitle.contains("[html]") -> SlideType.HTML
+                            else -> SlideType.HTML
+                        }
+                        currentManimScene = manimMatch?.groupValues?.get(1)
+                        currentTitle = rawTitle
+                            .replace(Regex("""\[manim:\w+]"""), "")
+                            .replace("[html]", "")
+                            .trim()
                     }
                     line.isNotBlank() && currentIndex >= 0 -> noteLines.add(line)
                 }
@@ -149,7 +165,9 @@ class CapsuleManager(private val project: Project) {
                     SlideSegment(
                         index = currentIndex,
                         title = currentTitle,
-                        speakerNote = noteLines.joinToString("\n").trim()
+                        speakerNote = noteLines.joinToString("\n").trim(),
+                        type = currentType,
+                        manimScene = currentManimScene
                     )
                 )
             }
@@ -537,42 +555,67 @@ open class CapsuleVideoTask : DefaultTask() {
         outputDir: File,
         cores: Int
     ): List<File> {
-        // Cap parallel Playwright instances: each Chromium needs ~300 MB RAM + CPU startup.
-        // Beyond 4 simultaneous instances the gains plateau and timeouts start appearing.
         val parallelism = minOf(cores, 4)
         val executor = Executors.newFixedThreadPool(parallelism)
         val futures = mutableListOf<Future<File?>>()
 
         val playwrightTimeout = capsuleExtension.playwrightTimeout.get()
-        val viewportWidth    = capsuleExtension.viewportWidth.get()
-        val viewportHeight   = capsuleExtension.viewportHeight.get()
-        val defaultDur       = capsuleExtension.slideDurationSeconds.get()
+        val viewportWidth     = capsuleExtension.viewportWidth.get()
+        val viewportHeight    = capsuleExtension.viewportHeight.get()
+        val defaultDur        = capsuleExtension.slideDurationSeconds.get()
+        val manimExec         = capsuleExtension.manimExecutablePath.get()
+        val manimQuality      = capsuleExtension.manimQuality.get()
+        val manimScriptsDir   = project.file(capsuleExtension.manimScriptsDir.get())
 
         for ((i, seg) in script.slides.withIndex()) {
-            val duration  = slideDurations.getOrElse(i) { defaultDur }
-            val slideDir  = outputDir.resolve("slide-${String.format("%02d", seg.index)}").also { it.mkdirs() }
-            val slideHtml = createSingleSlideHtml(deck, i)
+            val duration = slideDurations.getOrElse(i) { defaultDur }
+            val slideDir = outputDir.resolve("slide-${String.format("%02d", seg.index)}").also { it.mkdirs() }
 
-            futures.add(executor.submit<File?> {
-                val capture = ScreenshotCaptureImpl(timeout = playwrightTimeout)
-                return@submit try {
-                    capture.capture(
-                        deckHtmlPath = slideHtml.absolutePath,
-                        outputDir = slideDir,
-                        viewportWidth = viewportWidth,
-                        viewportHeight = viewportHeight,
-                        slideDurations = listOf(duration)
-                    )
-                    capture.close()
-                    val webm = slideDir.resolve("slide.webm").takeIf { it.exists() }
-                    logger.lifecycle("  ✓ slide {} ({}s)", seg.index, String.format("%.1f", duration))
-                    webm
-                } catch (e: Exception) {
-                    capture.close()
-                    logger.error("  ✗ slide {} failed: {}", seg.index, e.message)
-                    null
+            when (seg.type) {
+                SlideType.MANIM -> {
+                    val sceneName = seg.manimScene
+                        ?: throw IllegalStateException("Slide ${seg.index} has type MANIM but no manimScene name")
+                    val scriptFile = manimScriptsDir.resolve("${script.deckName}.py")
+
+                    futures.add(executor.submit<File?> {
+                        val webm = slideDir.resolve("slide.webm")
+                        return@submit try {
+                            val engine = ManimEngine(manimExec, manimQuality)
+                            engine.render(scriptFile, sceneName, webm)
+                            val realDur = engine.probeDuration(webm)
+                            logger.lifecycle("  ✓ slide {} [manim:{}] ({}s)", seg.index, sceneName, String.format("%.1f", realDur))
+                            webm
+                        } catch (e: ManimException) {
+                            logger.error("  ✗ slide {} [manim:{}] failed: {}", seg.index, sceneName, e.message)
+                            null
+                        }
+                    })
                 }
-            })
+
+                SlideType.HTML -> {
+                    val slideHtml = createSingleSlideHtml(deck, i)
+                    futures.add(executor.submit<File?> {
+                        val capture = ScreenshotCaptureImpl(timeout = playwrightTimeout)
+                        return@submit try {
+                            capture.capture(
+                                deckHtmlPath = slideHtml.absolutePath,
+                                outputDir = slideDir,
+                                viewportWidth = viewportWidth,
+                                viewportHeight = viewportHeight,
+                                slideDurations = listOf(duration)
+                            )
+                            capture.close()
+                            val webm = slideDir.resolve("slide.webm").takeIf { it.exists() }
+                            logger.lifecycle("  ✓ slide {} [html] ({}s)", seg.index, String.format("%.1f", duration))
+                            webm
+                        } catch (e: Exception) {
+                            capture.close()
+                            logger.error("  ✗ slide {} [html] failed: {}", seg.index, e.message)
+                            null
+                        }
+                    })
+                }
+            }
         }
 
         executor.shutdown()
